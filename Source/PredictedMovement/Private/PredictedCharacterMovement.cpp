@@ -83,6 +83,7 @@ UPredictedCharacterMovement::UPredictedCharacterMovement(const FObjectInitialize
 	bUseMaxAccelerationSprintingOnlyAtSpeed = true;
 	MaxAccelerationSprinting = 2400.f;
 	MaxWalkSpeedSprinting = 860.f;
+	MaxSwimSpeedSprinting = 500.f;
 	BrakingDecelerationSprinting = 2048.f;
 	GroundFrictionSprinting = 12.f;
 	BrakingFrictionSprinting = 4.f;
@@ -105,8 +106,8 @@ UPredictedCharacterMovement::UPredictedCharacterMovement(const FObjectInitialize
 	BaseMaxStamina = 100.f;
 	SetMaxStamina(BaseMaxStamina);
 	SprintStaminaDrainRate = 34.f;
-	StaminaRegenRate = 20.f;
-	StaminaDrainedRegenRate = 10.f;
+	StaminaRegenRateNonMoving = 20.f;
+	StaminaRegenRateMoving = 10.f;
 	bStaminaRecoveryFromPct = true;
 	StaminaRecoveryAmount = 20.f;
 	StaminaRecoveryPct = 0.2f;
@@ -171,6 +172,7 @@ void FPredictedMoveResponseDataContainer::ServerFillResponseData(const UCharacte
 	// Stamina
 	bStaminaDrained = MoveComp->IsStaminaDrained();
 	Stamina = MoveComp->GetStamina();
+	MaxStamina = MoveComp->GetMaxStamina();
 
 	// Fill the response data with the current modifier state
 	BoostCorrection.ServerFillResponseData(MoveComp->BoostCorrection.Modifiers);
@@ -197,6 +199,7 @@ bool FPredictedMoveResponseDataContainer::Serialize(UCharacterMovementComponent&
 	{
 		// Serialize Stamina
 		Ar << Stamina;
+		Ar << MaxStamina;
 		Ar << bStaminaDrained;
 
 		// Serialize Modifiers
@@ -383,8 +386,16 @@ bool UPredictedCharacterMovement::IsGaitAtSpeed(float Mitigator) const
 {
 	// When moving on ground we want to factor moving uphill or downhill so variations in terrain
 	// aren't culled from the check. When falling, we don't want to factor fall velocity, only lateral
-	const float Vel = IsMovingOnGround() ? Velocity.SizeSquared() : Velocity.SizeSquared2D();
-
+	float Vel;
+	if (IsSwimming())
+	{
+		Vel = Velocity.SizeSquared();
+	}
+	else
+	{
+		Vel = IsMovingOnGround() ? Velocity.SizeSquared() : Velocity.SizeSquared2D();
+	}
+	
 	// When struggling to surpass walk speed, which can occur with heavy rotation and low acceleration, we
 	// mitigate the check so there isn't a constant re-entry that can occur as an edge case
 	return Vel >= FMath::Square(GetBaseMaxSpeed() * GetGaitSpeedFactor()) * Mitigator;
@@ -521,13 +532,21 @@ float UPredictedCharacterMovement::GetBaseMaxAcceleration() const
 float UPredictedCharacterMovement::GetBaseMaxSpeed() const
 {
 	if (IsFlying())		{ return MaxFlySpeed; }
-	if (IsSwimming())	{ return MaxSwimSpeed; }
+	if (IsSwimming())
+	{
+		switch (GetGaitMode())
+		{
+		case EPredGaitMode::Stroll: return MaxSwimSpeed;
+		case EPredGaitMode::Walk: return MaxSwimSpeed;
+		case EPredGaitMode::Run: return MaxSwimSpeed;
+		case EPredGaitMode::Sprint: return MaxSwimSpeedSprinting;
+		}
+	}
 	if (IsProned())		{ return MaxWalkSpeedProned; }
 	if (IsCrouching())	{ return MaxWalkSpeedCrouched; }
 	if (MovementMode == MOVE_Custom) { return MaxCustomMovementSpeed; }
 
-	const EPredGaitMode GaitMode = GetGaitMode();
-	switch (GaitMode)
+	switch (GetGaitMode())
 	{
 	case EPredGaitMode::Stroll: return MaxWalkSpeedStrolling;
 	case EPredGaitMode::Walk: return MaxWalkSpeed;
@@ -617,15 +636,16 @@ void UPredictedCharacterMovement::CalcStamina(float DeltaTime)
 	{
 		return;
 	}
-	
+
+	const bool bIsSprintingAtSpeed = IsSprintingAtSpeed();
+	const bool bIsInputAngleWithinSprint = IsSprintWithinAllowableInputAngle();
 	if (IsSprintingInEffect())
 	{
-		SetStamina(GetStamina() - SprintStaminaDrainRate * DeltaTime);
+		SetStamina(GetStamina() - GetStaminaDrainRate() * DeltaTime);
 	}
 	else
 	{
-		const float RegenRate = IsStaminaDrained() ? StaminaDrainedRegenRate : StaminaRegenRate;
-		SetStamina(GetStamina() + RegenRate * DeltaTime);
+		SetStamina(GetStamina() + GetStaminaRegenRate() * DeltaTime);
 	}
 }
 
@@ -900,8 +920,8 @@ bool UPredictedCharacterMovement::CanSprintInCurrentState() const
 		return false;
 	}
 
-	// Cannot sprint if in an invalid movement mode
-	if (!IsFalling() && !IsMovingOnGround())
+	// Cannot sprint if not falling, not swimming, and not moving on ground
+	if (!(IsFalling() || IsSwimming() || IsMovingOnGround()))
 	{
 		return false;
 	}
@@ -912,6 +932,16 @@ bool UPredictedCharacterMovement::CanSprintInCurrentState() const
 	}
 
 	if (IsProned() && !bCanSprintDuringProne)
+	{
+		return false;
+	}
+
+	if (IsAimingDownSights() && !bCanSprintDuringAimDownSights)
+	{
+		return false;
+	}
+	
+	if (!IsSprintWithinAllowableInputAngle())
 	{
 		return false;
 	}
@@ -938,6 +968,20 @@ bool UPredictedCharacterMovement::IsSprintWithinAllowableInputAngle() const
 	return Dot >= MaxInputNormalSprint;
 }
 
+float UPredictedCharacterMovement::GetStaminaRegenRate() const
+{
+	if (MovementMode == MOVE_Falling) return StaminaRegenRateMoving;
+	
+	const float CurSpeedSq = Velocity.SizeSquared2D();
+	const float ThresholdSq = (MovementMode == MOVE_Swimming)
+		? FMath::Square(MaxSwimSpeed * 0.5f)
+		: FMath::Square(MaxWalkSpeedCrouched);
+
+	return (CurSpeedSq > ThresholdSq)
+		? StaminaRegenRateMoving
+		: StaminaRegenRateNonMoving;
+}
+
 void UPredictedCharacterMovement::SetStamina(float NewStamina)
 {
 	const float PrevStamina = Stamina;
@@ -960,8 +1004,14 @@ void UPredictedCharacterMovement::SetMaxStamina(float NewMaxStamina)
 		if (!FMath::IsNearlyEqual(PrevMaxStamina, MaxStamina))
 		{
 			OnMaxStaminaChanged(PrevMaxStamina, MaxStamina);
+			if (GetOwner()->HasAuthority()) ClientSetMaxStamina(MaxStamina);
 		}
 	}
+}
+
+void UPredictedCharacterMovement::ClientSetMaxStamina_Implementation(const float NewMaxStamina)
+{
+	SetMaxStamina(NewMaxStamina);
 }
 
 void UPredictedCharacterMovement::SetStaminaDrained(bool bNewValue)
@@ -1723,7 +1773,7 @@ void UPredictedCharacterMovement::UpdateCharacterStateAfterMovement(float DeltaS
 
 	Super::UpdateCharacterStateAfterMovement(DeltaSeconds);
 	
-#if !UE_BUILD_SHIPPING
+#if UE_ENABLE_DEBUG_DRAWING
 	// Draw Stamina values to Screen
 	if (GEngine && PredMovementCVars::DrawStaminaValues > 0)
 	{
@@ -2041,6 +2091,7 @@ void UPredictedCharacterMovement::OnClientCorrectionReceived(class FNetworkPredi
 
 	// Stamina
 	SetStamina(MoveResponse.Stamina);
+	SetMaxStamina(MoveResponse.MaxStamina);
 	SetStaminaDrained(MoveResponse.bStaminaDrained);
 
 	// Modifiers

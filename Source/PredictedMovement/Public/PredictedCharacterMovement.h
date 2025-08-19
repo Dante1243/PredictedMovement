@@ -21,6 +21,7 @@ struct PREDICTEDMOVEMENT_API FPredictedMoveResponseDataContainer : FCharacterMov
 	using Super = FCharacterMoveResponseDataContainer;
 
 	float Stamina;
+	float MaxStamina;
 	bool bStaminaDrained;
 
 	/*
@@ -236,6 +237,10 @@ public:
 	UPROPERTY(Category="Character Movement: Walking", EditAnywhere, BlueprintReadWrite, meta=(ClampMin="0", UIMin="0", ForceUnits="cm/s"))
 	float MaxWalkSpeedSprinting;
 
+	/** The maximum speed when Sprinting while swimming. */
+	UPROPERTY(Category="Character Movement: Swimming", EditAnywhere, BlueprintReadWrite, meta=(ClampMin="0", UIMin="0", ForceUnits="cm/s"))
+	float MaxSwimSpeedSprinting;
+
 	/**
 	 * Deceleration when walking and not applying acceleration. This is a constant opposing force that directly lowers velocity by a constant value.
 	 * @see GroundFriction, MaxAcceleration
@@ -308,13 +313,13 @@ public:
 	UPROPERTY(Category="Character Movement (General Settings)", EditAnywhere, BlueprintReadWrite)
 	float SprintStaminaDrainRate;
 
-	/** The rate at which stamina is regenerated when not being drained */
+	/** The rate at which stamina is regenerated when the player is not moving faster than the max crouch speed */
 	UPROPERTY(Category="Character Movement (General Settings)", EditAnywhere, BlueprintReadWrite)
-	float StaminaRegenRate;
+	float StaminaRegenRateNonMoving;
 
-	/** The rate at which stamina is regenerated when in a drained state */
+	/** The rate at which stamina is regenerated when the player is moving faster than the max crouch speed */
 	UPROPERTY(Category="Character Movement (General Settings)", EditAnywhere, BlueprintReadWrite)
-	float StaminaDrainedRegenRate;
+	float StaminaRegenRateMoving;
 
 	/** If true, stamina recovery from drained state is based on percentage instead of amount */
 	UPROPERTY(Category="Character Movement (General Settings)", EditAnywhere, BlueprintReadWrite)
@@ -866,9 +871,12 @@ public:
 
 	void SetStamina(float NewStamina);
 	void SetMaxStamina(float NewMaxStamina);
+	UFUNCTION(Client, Reliable)
+    void ClientSetMaxStamina(const float NewMaxStamina);
 	void SetStaminaDrained(bool bNewValue);
 	
 protected:
+	
 	/*
 	 * Drain state entry and exit is handled here. Drain state is used to prevent rapid re-entry of sprinting or other
 	 * such abilities before sufficient stamina has regenerated. However, in the default implementation, 100%
@@ -878,6 +886,9 @@ protected:
 	virtual void OnMaxStaminaChanged(float PrevValue, float NewValue);
 	virtual void OnStaminaDrained();
 	virtual void OnStaminaDrainRecovered();
+
+	virtual float GetStaminaDrainRate() const { return SprintStaminaDrainRate; }
+	virtual float GetStaminaRegenRate() const;
 
 public:
 	virtual bool IsAimingDownSights() const;
