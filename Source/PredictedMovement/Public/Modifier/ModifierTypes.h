@@ -7,7 +7,7 @@
 #include "Curves/CurveFloat.h"
 #include "ModifierTypes.generated.h"
 
-#define NO_MODIFIER UINT8_MAX
+#define NO_MODIFIER TNumericLimits<uint8>::Max()
 
 /**
  * The network type of the modifier, which determines how it is applied and synchronized across clients and servers
